@@ -386,16 +386,23 @@ export class ArrClient {
 
   constructor(serviceName: ArrService, config: ArrConfig) {
     this.serviceName = serviceName;
+    let parsed: URL;
+    try { parsed = new URL(config.url); } catch {
+      throw new Error(`${serviceName}: invalid URL "${config.url}"`);
+    }
+    if (!['http:', 'https:'].includes(parsed.protocol)) {
+      throw new Error(`${serviceName}: URL must use http:// or https://`);
+    }
     this.config = {
       url: config.url.replace(/\/$/, ''),
-      apiKey: config.apiKey
+      apiKey: config.apiKey,
     };
   }
 
   /**
    * Make an API request
    */
-  protected async request<T>(endpoint: string, options: RequestInit = {}): Promise<T> {
+  public async request<T>(endpoint: string, options: RequestInit = {}): Promise<T> {
     const url = `${this.config.url}/api/${this.apiVersion}${endpoint}`;
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
@@ -406,11 +413,16 @@ export class ArrClient {
     const response = await fetch(url, {
       ...options,
       headers,
+      signal: options.signal ?? AbortSignal.timeout(30_000),
     });
 
     if (!response.ok) {
-      const text = await response.text();
-      throw new Error(`${this.serviceName} API error: ${response.status} ${response.statusText} - ${text}`);
+      const text = await response.text().catch(() => '');
+      const truncated = text.slice(0, 500);
+      throw new Error(
+        `${this.serviceName} API error: ${response.status} ${response.statusText}` +
+        (truncated ? ` - ${truncated}` : '')
+      );
     }
 
     return response.json() as Promise<T>;
@@ -541,28 +553,28 @@ export class SonarrClient extends ArrClient {
    * Get all series
    */
   async getSeries(): Promise<Series[]> {
-    return this['request']<Series[]>('/series');
+    return this.request<Series[]>('/series');
   }
 
   /**
    * Get a specific series
    */
   async getSeriesById(id: number): Promise<Series> {
-    return this['request']<Series>(`/series/${id}`);
+    return this.request<Series>(`/series/${id}`);
   }
 
   /**
    * Search for series
    */
   async searchSeries(term: string): Promise<SearchResult[]> {
-    return this['request']<SearchResult[]>(`/series/lookup?term=${encodeURIComponent(term)}`);
+    return this.request<SearchResult[]>(`/series/lookup?term=${encodeURIComponent(term)}`);
   }
 
   /**
    * Add a series
    */
   async addSeries(series: Partial<Series> & { tvdbId: number; rootFolderPath: string; qualityProfileId: number }): Promise<Series> {
-    return this['request']<Series>('/series', {
+    return this.request<Series>('/series', {
       method: 'POST',
       body: JSON.stringify({
         ...series,
@@ -579,7 +591,7 @@ export class SonarrClient extends ArrClient {
    * Trigger a search for missing episodes
    */
   async searchMissing(seriesId: number): Promise<{ id: number }> {
-    return this['request']<{ id: number }>('/command', {
+    return this.request<{ id: number }>('/command', {
       method: 'POST',
       body: JSON.stringify({
         name: 'SeriesSearch',
@@ -596,14 +608,14 @@ export class SonarrClient extends ArrClient {
     if (seasonNumber !== undefined) {
       url += `&seasonNumber=${seasonNumber}`;
     }
-    return this['request']<Episode[]>(url);
+    return this.request<Episode[]>(url);
   }
 
   /**
    * Search for a specific episode
    */
   async searchEpisode(episodeIds: number[]): Promise<{ id: number }> {
-    return this['request']<{ id: number }>('/command', {
+    return this.request<{ id: number }>('/command', {
       method: 'POST',
       body: JSON.stringify({
         name: 'EpisodeSearch',
@@ -616,7 +628,7 @@ export class SonarrClient extends ArrClient {
    * Trigger a refresh for a specific series
    */
   async refreshSeries(seriesId: number): Promise<{ id: number }> {
-    return this['request']<{ id: number }>('/command', {
+    return this.request<{ id: number }>('/command', {
       method: 'POST',
       body: JSON.stringify({
         name: 'RefreshSeries',
@@ -635,28 +647,28 @@ export class RadarrClient extends ArrClient {
    * Get all movies
    */
   async getMovies(): Promise<Movie[]> {
-    return this['request']<Movie[]>('/movie');
+    return this.request<Movie[]>('/movie');
   }
 
   /**
    * Get a specific movie
    */
   async getMovieById(id: number): Promise<Movie> {
-    return this['request']<Movie>(`/movie/${id}`);
+    return this.request<Movie>(`/movie/${id}`);
   }
 
   /**
    * Search for movies
    */
   async searchMovies(term: string): Promise<SearchResult[]> {
-    return this['request']<SearchResult[]>(`/movie/lookup?term=${encodeURIComponent(term)}`);
+    return this.request<SearchResult[]>(`/movie/lookup?term=${encodeURIComponent(term)}`);
   }
 
   /**
    * Add a movie
    */
   async addMovie(movie: Partial<Movie> & { tmdbId: number; rootFolderPath: string; qualityProfileId: number }): Promise<Movie> {
-    return this['request']<Movie>('/movie', {
+    return this.request<Movie>('/movie', {
       method: 'POST',
       body: JSON.stringify({
         ...movie,
@@ -672,7 +684,7 @@ export class RadarrClient extends ArrClient {
    * Trigger a search for a movie
    */
   async searchMovie(movieId: number): Promise<{ id: number }> {
-    return this['request']<{ id: number }>('/command', {
+    return this.request<{ id: number }>('/command', {
       method: 'POST',
       body: JSON.stringify({
         name: 'MoviesSearch',
@@ -685,7 +697,7 @@ export class RadarrClient extends ArrClient {
    * Trigger a refresh for a specific movie
    */
   async refreshMovie(movieId: number): Promise<{ id: number }> {
-    return this['request']<{ id: number }>('/command', {
+    return this.request<{ id: number }>('/command', {
       method: 'POST',
       body: JSON.stringify({
         name: 'RefreshMovie',
@@ -705,28 +717,28 @@ export class LidarrClient extends ArrClient {
    * Get all artists
    */
   async getArtists(): Promise<Artist[]> {
-    return this['request']<Artist[]>('/artist');
+    return this.request<Artist[]>('/artist');
   }
 
   /**
    * Get a specific artist
    */
   async getArtistById(id: number): Promise<Artist> {
-    return this['request']<Artist>(`/artist/${id}`);
+    return this.request<Artist>(`/artist/${id}`);
   }
 
   /**
    * Search for artists
    */
   async searchArtists(term: string): Promise<SearchResult[]> {
-    return this['request']<SearchResult[]>(`/artist/lookup?term=${encodeURIComponent(term)}`);
+    return this.request<SearchResult[]>(`/artist/lookup?term=${encodeURIComponent(term)}`);
   }
 
   /**
    * Add an artist
    */
   async addArtist(artist: Partial<Artist> & { foreignArtistId: string; rootFolderPath: string; qualityProfileId: number; metadataProfileId: number }): Promise<Artist> {
-    return this['request']<Artist>('/artist', {
+    return this.request<Artist>('/artist', {
       method: 'POST',
       body: JSON.stringify({
         ...artist,
@@ -742,22 +754,25 @@ export class LidarrClient extends ArrClient {
    * Get all albums, optionally filtered by artist
    */
   async getAlbums(artistId?: number): Promise<Album[]> {
-    const url = artistId ? `/album?artistId=${artistId}` : '/album';
-    return this['request']<Album[]>(url);
+    if (artistId !== undefined && (!Number.isInteger(artistId) || artistId < 0)) {
+      throw new Error('artistId must be a non-negative integer');
+    }
+    const url = artistId !== undefined ? `/album?artistId=${artistId}` : '/album';
+    return this.request<Album[]>(url);
   }
 
   /**
    * Get a specific album
    */
   async getAlbumById(id: number): Promise<Album> {
-    return this['request']<Album>(`/album/${id}`);
+    return this.request<Album>(`/album/${id}`);
   }
 
   /**
    * Search for missing albums for an artist
    */
   async searchMissingAlbums(artistId: number): Promise<{ id: number }> {
-    return this['request']<{ id: number }>('/command', {
+    return this.request<{ id: number }>('/command', {
       method: 'POST',
       body: JSON.stringify({
         name: 'ArtistSearch',
@@ -770,7 +785,7 @@ export class LidarrClient extends ArrClient {
    * Search for a specific album
    */
   async searchAlbum(albumId: number): Promise<{ id: number }> {
-    return this['request']<{ id: number }>('/command', {
+    return this.request<{ id: number }>('/command', {
       method: 'POST',
       body: JSON.stringify({
         name: 'AlbumSearch',
@@ -787,14 +802,14 @@ export class LidarrClient extends ArrClient {
     if (start) params.append('start', start);
     if (end) params.append('end', end);
     const query = params.toString() ? `?${params.toString()}` : '';
-    return this['request']<Album[]>(`/calendar${query}`);
+    return this.request<Album[]>(`/calendar${query}`);
   }
 
   /**
    * Get metadata profiles
    */
   async getMetadataProfiles(): Promise<MetadataProfile[]> {
-    return this['request']<MetadataProfile[]>('/metadataprofile');
+    return this.request<MetadataProfile[]>('/metadataprofile');
   }
 }
 
@@ -823,28 +838,28 @@ export class ProwlarrClient extends ArrClient {
    * Get all indexers
    */
   async getIndexers(): Promise<Indexer[]> {
-    return this['request']<Indexer[]>('/indexer');
+    return this.request<Indexer[]>('/indexer');
   }
 
   /**
    * Test all indexers
    */
   async testAllIndexers(): Promise<Array<{ id: number; isValid: boolean; validationFailures: Array<{ propertyName: string; errorMessage: string }> }>> {
-    return this['request']<Array<{ id: number; isValid: boolean; validationFailures: Array<{ propertyName: string; errorMessage: string }> }>>('/indexer/testall', { method: 'POST' });
+    return this.request<Array<{ id: number; isValid: boolean; validationFailures: Array<{ propertyName: string; errorMessage: string }> }>>('/indexer/testall', { method: 'POST' });
   }
 
   /**
    * Test a specific indexer
    */
   async testIndexer(indexerId: number): Promise<{ id: number; isValid: boolean; validationFailures: Array<{ propertyName: string; errorMessage: string }> }> {
-    return this['request']<{ id: number; isValid: boolean; validationFailures: Array<{ propertyName: string; errorMessage: string }> }>(`/indexer/${indexerId}/test`, { method: 'POST' });
+    return this.request<{ id: number; isValid: boolean; validationFailures: Array<{ propertyName: string; errorMessage: string }> }>(`/indexer/${indexerId}/test`, { method: 'POST' });
   }
 
   /**
    * Get indexer statistics
    */
   async getIndexerStats(): Promise<{ indexers: IndexerStats[] }> {
-    return this['request']<{ indexers: IndexerStats[] }>('/indexerstats');
+    return this.request<{ indexers: IndexerStats[] }>('/indexerstats');
   }
 
   /**
@@ -855,6 +870,6 @@ export class ProwlarrClient extends ArrClient {
     if (categories) {
       categories.forEach(c => params.append('categories', c.toString()));
     }
-    return this['request']<unknown[]>(`/search?${params.toString()}`);
+    return this.request<unknown[]>(`/search?${params.toString()}`);
   }
 }
