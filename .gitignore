@@ -10,3 +10,11 @@ dist/
 # Local planning / session handoff notes
 NEXT-SESSION.md
 SESSION-*.md
+
+# OMC planning / state (never commit)
+.omc/
+
+# Local environment files
+.env
+.env.*
+!.env.example
