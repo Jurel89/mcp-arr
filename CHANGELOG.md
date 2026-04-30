@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.7.0] - 2026-04-30
+
+### Added
+- `MCP_AUTH_TOKEN` env var: when set, every `/mcp` request must include `Authorization: Bearer <token>`; required when binding to `0.0.0.0`
+- `MCP_ALLOWED_ORIGINS` env var: comma-separated allowlist of `Origin` headers to mitigate DNS-rebinding; matching is exact normalized-origin (scheme + host + port), not prefix; requests with a disallowed `Origin` receive `403`
+- `MCP_ALLOWED_HOSTS` env var: comma-separated allowlist of `Host` header values to mitigate DNS-rebinding (default: `localhost`, `127.0.0.1`, `::1` and the configured bind host); requests with an unrecognized `Host` receive `403`
+- `MCP_BODY_LIMIT_BYTES` env var: maximum inbound request body size (default 1 MB); larger bodies receive `413`
+- `MCP_REQUEST_TIMEOUT_MS` env var: per-request timeout to prevent slowloris-style attacks (default 30 s)
+- `MCP_RATE_LIMIT_DISABLED` env var: set to `"true"` to disable the per-tool fixed-window rate limiter (default: enabled, 60-second windows for add/search/command tools)
+- `GITHUB_TOKEN` env var: optional GitHub personal access token used when fetching TRaSH Guides data from `api.github.com`; raises the unauthenticated 60 req/hr rate limit to 5 000 req/hr
+- Per-tool rate limiter on destructive/fan-out tools (`*_add_*`, `*_search_*`, `prowlarr_search`, `arr_search_all`, `trash_list_custom_formats`)
+- Graceful SIGTERM/SIGINT shutdown: in-flight HTTP requests are drained before the process exits
+- Startup duplicate-tool-name assertion: `main()` throws if any tool name is registered more than once, preventing the class of bug fixed in v1.5.4 from recurring silently
+- In-flight singleflight coalescing in `TrashCache`: concurrent callers for the same cache key share one outbound fetch instead of fanning out
+
+### Changed
+- `ArrClient.request<T>()` promoted from `protected` to `public` to match the de-facto usage by all subclasses
+- `getPaginatedQueue` now fetches only the API pages required to satisfy `[offset, offset+limit]` instead of the entire queue; `offset=500, limit=25` now issues exactly one API call
+
+### Fixed
+- `fetch` tool returned "not found" for every TRaSH quality profile: the id parser destructured 4 colon-segments into 3 variables, leaving `rawId` as `undefined` (audit finding C3)
+- `fetch` tool returned wrong or empty results for *arr items: sonarr and radarr branches used free-text title search on a numeric TVDB/TMDB id instead of a typed `tvdb:`/`tmdb:` lookup (audit finding C4)
+- `lidarr_get_quality_profiles` and `lidarr_get_root_folders` were registered twice; the second `TOOLS.push` entries were duplicates of what `addConfigTools('lidarr', …)` already added, and the corresponding `case` blocks in the dispatch switch were unreachable (audit finding C2; recurrence of v1.5.4 pattern)
+- Calendar `days: 0` silently fell back to the default 7 or 30 days via falsy coercion (`||`); now `??` is used so 0 correctly returns today-only (audit finding H1)
+- Calendar `days: -1` silently produced an invalid date range; now throws `"days must be an integer in [0, 365]"` (audit finding H1)
+- Calendar `days: "abc"` threw an uncaught `RangeError` from `Date`; now caught and reported cleanly (audit finding H1)
+- `formatBytes(NaN)`, `formatBytes(-1)`, and `formatBytes(undefined)` produced `"NaN undefined"`; now return `"0 B"` (audit finding H2)
+- `sonarr_get_series` rendered `"undefined/undefined"` for newly-added series with no statistics; now returns `"unknown"` (audit finding H3)
+- `lidarr_get_artists` rendered `"undefined/undefined"` for artists with no statistics; now returns `"unknown"` (audit finding H3)
+- HTTP transport now requires `MCP_AUTH_TOKEN` when binding to any wildcard interface (`0.0.0.0`, `::`, `::0`, `*`); startup refuses with a clear error message if the token is absent (audit finding C1)
+- Bearer-token comparison is timing-safe and length-leak-resistant (`timingSafeEqualStrings` no longer early-returns on length mismatch); `/health` and `/mcp` use the same comparator
+- HTTP error responses no longer leak internal *arr service URLs or raw `error.message` text (audit finding H4)
+- All outbound `fetch` calls now carry `AbortSignal.timeout(30_000)` to prevent hung connections from blocking the process indefinitely (audit finding H8)
+- `*_URL` env vars are now validated at startup: must use `http://` or `https://`; invalid schemes throw a clear error (audit finding H9)
+- Lidarr `getAlbums(artistId=0)` returned the entire library due to JS truthiness (`0` is falsy); fixed with explicit `!== undefined` guard (audit finding M7)
+- `mediaServer: "__proto__"` no longer escapes into `Object.prototype` via bracket-notation lookup on `serverMap`; unknown values are rejected with a clean error (codex finding)
+- `trash_compare_naming` now uses Sonarr-specific naming keys (`seriesFolderFormat`, `standardEpisodeFormat`) instead of the Radarr keys for the Sonarr branch (audit finding M6)
+- Short or purely numeric `search` queries no longer trigger a TRaSH Guides fan-out that could never return useful results (audit finding M4)
+
+### Security
+- HTTP transport hardened with bearer auth, `Host` header allowlist, exact-match `Origin` allowlist, body-size cap (Content-Length pre-check + socket-level byte counter), per-request timeout, and graceful drain on shutdown (audit finding C1/H6)
+- CI `npm audit --audit-level=high` step is now **blocking** (`continue-on-error: true` removed); previously failing audits were silently ignored (audit finding H10)
+- `GITHUB_TOKEN` support allows authenticated GitHub API calls for TRaSH Guides data, reducing exposure to unauthenticated rate-limit exhaustion (audit finding M9)
+- Server refuses to start in HTTP mode on `0.0.0.0` without `MCP_AUTH_TOKEN`; anyone on the network would otherwise be able to drive the *arr stack unauthenticated
+
 ## [1.6.3] - 2026-04-27
 
 ### Fixed

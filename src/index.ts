@@ -21,7 +21,7 @@ import {
   Tool,
 } from "@modelcontextprotocol/sdk/types.js";
 import { createServer } from "node:http";
-import { randomUUID } from "node:crypto";
+import { randomUUID, timingSafeEqual } from "node:crypto";
 import {
   SonarrClient,
   RadarrClient,
@@ -31,11 +31,16 @@ import {
 } from "./arr-client.js";
 import { trashClient, TrashService } from "./trash-client.js";
 
-const SERVER_VERSION = "1.6.3";
+const SERVER_VERSION = "1.7.0";
 const TRANSPORT_MODE = (process.env.MCP_TRANSPORT || "stdio").toLowerCase();
 const HTTP_HOST = process.env.HOST || "127.0.0.1";
-const HTTP_PORT = Number(process.env.PORT || "3000");
 const HTTP_PATH = process.env.MCP_PATH || "/mcp";
+
+// Auth / security constants (HTTP mode only)
+const MCP_AUTH_TOKEN = process.env.MCP_AUTH_TOKEN; // optional; if set, required for /mcp
+const MCP_ALLOWED_ORIGINS = (process.env.MCP_ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
+const MCP_BODY_LIMIT = Number(process.env.MCP_BODY_LIMIT_BYTES || 1_048_576); // default 1 MB
+const MCP_REQUEST_TIMEOUT_MS = Number(process.env.MCP_REQUEST_TIMEOUT_MS || 30_000); // default 30s
 
 // Configuration from environment
 interface ServiceConfig {
@@ -658,24 +663,6 @@ if (clients.lidarr) {
       },
     },
     {
-      name: "lidarr_get_root_folders",
-      description: "Get available root folders for Lidarr. Use this to find valid rootFolderPath values when adding an artist.",
-      inputSchema: {
-        type: "object" as const,
-        properties: {},
-        required: [],
-      },
-    },
-    {
-      name: "lidarr_get_quality_profiles",
-      description: "Get available quality profiles for Lidarr. Use this to find valid qualityProfileId values when adding an artist.",
-      inputSchema: {
-        type: "object" as const,
-        properties: {},
-        required: [],
-      },
-    },
-    {
       name: "lidarr_get_metadata_profiles",
       description: "Get available metadata profiles for Lidarr. Use this to find valid metadataProfileId values when adding an artist.",
       inputSchema: {
@@ -915,18 +902,20 @@ function buildResourceUrl(path: string): string {
   return `mcp-arr://${path}`;
 }
 
+// Module-level map for media server naming keys (shared by trash_get_naming + trash_compare_naming)
+const MEDIA_SERVER_NAMING_MAP: Record<string, { folder: string; file: string }> = {
+  plex: { folder: 'plex-imdb', file: 'plex-imdb' },
+  emby: { folder: 'emby-imdb', file: 'emby-imdb' },
+  jellyfin: { folder: 'jellyfin-imdb', file: 'jellyfin-imdb' },
+  standard: { folder: 'default', file: 'standard' },
+};
+
 function jsonText(data: unknown) {
   return {
     content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }],
   };
 }
 
-function textError(message: string) {
-  return {
-    content: [{ type: "text" as const, text: message }],
-    isError: true,
-  };
-}
 
 async function runUnifiedSearch(query: string): Promise<SearchEntry[]> {
   const results: SearchEntry[] = [];
@@ -938,24 +927,27 @@ async function runUnifiedSearch(query: string): Promise<SearchEntry[]> {
 
   const lowerQuery = trimmedQuery.toLowerCase();
 
-  for (const service of ["radarr", "sonarr"] as const) {
-    const profiles = await trashClient.listProfiles(service);
-    results.push(
-      ...profiles
-        .filter((profile) =>
-          profile.name.toLowerCase().includes(lowerQuery) ||
-          profile.description?.toLowerCase().includes(lowerQuery)
-        )
-        .slice(0, 8)
-        .map((profile) => ({
-          id: `trash-profile:${service}:${profile.name}`,
-          title: `${profile.name} (${service})`,
-          url: buildResourceUrl(`trash/profile/${service}/${encodeURIComponent(profile.name)}`),
-          type: "trash_profile",
-          service,
-          summary: profile.description?.replace(/<br>/g, " "),
-        }))
-    );
+  const isShortOrNumeric = trimmedQuery.length < 3 || /^\d+$/.test(trimmedQuery);
+  if (!isShortOrNumeric) {
+    for (const service of ["radarr", "sonarr"] as const) {
+      const profiles = await trashClient.listProfiles(service);
+      results.push(
+        ...profiles
+          .filter((profile) =>
+            profile.name.toLowerCase().includes(lowerQuery) ||
+            profile.description?.toLowerCase().includes(lowerQuery)
+          )
+          .slice(0, 8)
+          .map((profile) => ({
+            id: `trash-profile:${service}:profile:${profile.name}`,
+            title: `${profile.name} (${service})`,
+            url: buildResourceUrl(`trash/profile/${service}/${encodeURIComponent(profile.name)}`),
+            type: "trash_profile",
+            service,
+            summary: profile.description?.replace(/<br>/g, " "),
+          }))
+      );
+    }
   }
 
   if (clients.sonarr) {
@@ -1004,7 +996,12 @@ async function runUnifiedSearch(query: string): Promise<SearchEntry[]> {
 }
 
 async function fetchSearchEntry(id: string): Promise<unknown> {
-  const [kind, service, subtype, rawId] = id.split(":");
+  const parts = id.split(":");
+  if (parts.length < 4) {
+    throw new Error(`Invalid fetch id: expected at least 4 segments, got '${id}'`);
+  }
+  const [kind, service, subtype, ...rest] = parts;
+  const rawId = rest.join(":");
 
   if (kind === "trash-profile" && (service === "radarr" || service === "sonarr")) {
     const profile = await trashClient.getProfile(service, rawId);
@@ -1041,7 +1038,10 @@ async function fetchSearchEntry(id: string): Promise<unknown> {
 
   if (service === "sonarr" && subtype === "series" && clients.sonarr) {
     const tvdbId = Number(rawId);
-    const matches = (await clients.sonarr.searchSeries(rawId)).filter((item) => item.tvdbId === tvdbId);
+    if (!Number.isInteger(tvdbId) || tvdbId <= 0) {
+      throw new Error(`Invalid tvdbId '${rawId}': must be a positive integer`);
+    }
+    const matches = (await clients.sonarr.searchSeries(`tvdb:${rawId}`)).filter((item) => item.tvdbId === tvdbId);
     return {
       id,
       title: matches[0]?.title || rawId,
@@ -1054,7 +1054,10 @@ async function fetchSearchEntry(id: string): Promise<unknown> {
 
   if (service === "radarr" && subtype === "movie" && clients.radarr) {
     const tmdbId = Number(rawId);
-    const matches = (await clients.radarr.searchMovies(rawId)).filter((item) => item.tmdbId === tmdbId);
+    if (!Number.isInteger(tmdbId) || tmdbId <= 0) {
+      throw new Error(`Invalid tmdbId '${rawId}': must be a positive integer`);
+    }
+    const matches = (await clients.radarr.searchMovies(`tmdb:${rawId}`)).filter((item) => item.tmdbId === tmdbId);
     return {
       id,
       title: matches[0]?.title || rawId,
@@ -1066,6 +1069,9 @@ async function fetchSearchEntry(id: string): Promise<unknown> {
   }
 
   if (service === "lidarr" && subtype === "artist" && clients.lidarr) {
+    if (!rawId) {
+      throw new Error(`Invalid foreignArtistId: must not be empty`);
+    }
     const matches = (await clients.lidarr.searchArtists(rawId)).filter((item) => item.foreignArtistId === rawId);
     return {
       id,
@@ -1086,26 +1092,27 @@ async function getPaginatedQueue(
   client: QueueCapableClient,
   args: { limit?: number; offset?: number } | undefined
 ) {
-  const limit = Math.min(Math.max(Math.floor(args?.limit ?? 25), 1), 100);
-  const offset = Math.max(Math.floor(args?.offset ?? 0), 0);
-  const pageSize = 100;
-  const records = [];
-  let totalRecords = 0;
-  let page = 1;
+  const limit = clampInt(args?.limit ?? 25, 25, 1, 100, 'limit');
+  const offset = clampInt(args?.offset ?? 0, 0, 0, Number.MAX_SAFE_INTEGER, 'offset');
+  const apiPageSize = 100;
 
-  while (true) {
-    const queuePage = await client.getQueue(page, pageSize);
+  // Compute which API pages cover [offset, offset+limit-1] (1-indexed pages)
+  const startPage = Math.floor(offset / apiPageSize) + 1;
+  const endPage = Math.floor((offset + limit - 1) / apiPageSize) + 1;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const records: any[] = [];
+  let totalRecords = 0;
+
+  for (let page = startPage; page <= endPage; page++) {
+    const queuePage = await client.getQueue(page, apiPageSize);
     totalRecords = queuePage.totalRecords;
     records.push(...queuePage.records);
-
-    if (records.length >= totalRecords || queuePage.records.length === 0) {
-      break;
-    }
-
-    page += 1;
+    if (queuePage.records.length < apiPageSize) break;
   }
 
-  const items = records.slice(offset, offset + limit).map((q) => ({
+  // Slice within the fetched records to get the requested window
+  const localOffset = offset - (startPage - 1) * apiPageSize;
+  const items = records.slice(localOffset, localOffset + limit).map((q) => ({
     title: q.title,
     status: q.status,
     progress: q.size > 0 ? ((1 - q.sizeleft / q.size) * 100).toFixed(1) + "%" : "unknown",
@@ -1135,6 +1142,12 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
 // Handle tool calls
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
+
+  // W1.15 — per-tool rate limit
+  const rlCat = rateLimitCategory(name);
+  if (rlCat && !checkRateLimit(rlCat.key, rlCat.max)) {
+    return { content: [{ type: 'text' as const, text: `Rate limit exceeded for ${rlCat.key}. Try again in a minute.` }], isError: true };
+  }
 
   try {
     switch (name) {
@@ -1438,13 +1451,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       // Sonarr handlers
       case "sonarr_get_series": {
         if (!clients.sonarr) throw new Error("Sonarr not configured");
-        const { limit = 25, offset = 0, search } = args as {
-          limit?: number;
-          offset?: number;
+        const { limit: rawLimit_s, offset: rawOffset_s, search } = args as {
+          limit?: unknown;
+          offset?: unknown;
           search?: string;
         };
-        const normalizedLimit = Math.max(1, Math.min(limit, 100));
-        const normalizedOffset = Math.max(0, offset);
+        const normalizedLimit = clampInt(rawLimit_s ?? 25, 25, 1, 100, 'limit');
+        const normalizedOffset = clampInt(rawOffset_s ?? 0, 0, 0, Number.MAX_SAFE_INTEGER, 'offset');
         const filter = search?.trim().toLowerCase();
 
         const allSeries = await clients.sonarr.getSeries();
@@ -1473,7 +1486,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 status: s.status,
                 network: s.network,
                 seasons: s.statistics?.seasonCount,
-                episodes: s.statistics?.episodeFileCount + '/' + s.statistics?.totalEpisodeCount,
+                episodes: s.statistics ? `${s.statistics.episodeFileCount}/${s.statistics.totalEpisodeCount}` : 'unknown',
                 sizeOnDisk: formatBytes(s.statistics?.sizeOnDisk || 0),
                 monitored: s.monitored,
               })),
@@ -1509,7 +1522,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case "sonarr_get_calendar": {
         if (!clients.sonarr) throw new Error("Sonarr not configured");
-        const days = (args as { days?: number })?.days || 7;
+        const rawDays_sonarr = (args as { days?: number })?.days;
+        const days = rawDays_sonarr ?? 7;
+        if (!Number.isInteger(days) || days < 0 || days > 365) {
+          throw new Error("days must be an integer in [0, 365]");
+        }
         const start = new Date().toISOString().split('T')[0];
         const end = new Date(Date.now() + days * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
         const calendar = await clients.sonarr.getCalendar(start, end);
@@ -1621,13 +1638,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       // Radarr handlers
       case "radarr_get_movies": {
         if (!clients.radarr) throw new Error("Radarr not configured");
-        const { limit = 25, offset = 0, search } = args as {
-          limit?: number;
-          offset?: number;
+        const { limit: rawLimit_r, offset: rawOffset_r, search } = args as {
+          limit?: unknown;
+          offset?: unknown;
           search?: string;
         };
-        const normalizedLimit = Math.max(1, Math.min(limit, 100));
-        const normalizedOffset = Math.max(0, offset);
+        const normalizedLimit = clampInt(rawLimit_r ?? 25, 25, 1, 100, 'limit');
+        const normalizedOffset = clampInt(rawOffset_r ?? 0, 0, 0, Number.MAX_SAFE_INTEGER, 'offset');
         const filter = search?.trim().toLowerCase();
 
         const allMovies = await clients.radarr.getMovies();
@@ -1692,7 +1709,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case "radarr_get_calendar": {
         if (!clients.radarr) throw new Error("Radarr not configured");
-        const days = (args as { days?: number })?.days || 30;
+        const rawDays_radarr = (args as { days?: number })?.days;
+        const days = rawDays_radarr ?? 30;
+        if (!Number.isInteger(days) || days < 0 || days > 365) {
+          throw new Error("days must be an integer in [0, 365]");
+        }
         const start = new Date().toISOString().split('T')[0];
         const end = new Date(Date.now() + days * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
         const calendar = await clients.radarr.getCalendar(start, end);
@@ -1776,7 +1797,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 artistName: a.artistName,
                 status: a.status,
                 albums: a.statistics?.albumCount,
-                tracks: a.statistics?.trackFileCount + '/' + a.statistics?.totalTrackCount,
+                tracks: a.statistics ? `${a.statistics.trackFileCount}/${a.statistics.totalTrackCount}` : 'unknown',
                 sizeOnDisk: formatBytes(a.statistics?.sizeOnDisk || 0),
                 monitored: a.monitored,
               })),
@@ -1871,7 +1892,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case "lidarr_get_calendar": {
         if (!clients.lidarr) throw new Error("Lidarr not configured");
-        const days = (args as { days?: number })?.days || 30;
+        const rawDays_lidarr = (args as { days?: number })?.days;
+        const days = rawDays_lidarr ?? 30;
+        if (!Number.isInteger(days) || days < 0 || days > 365) {
+          throw new Error("days must be an integer in [0, 365]");
+        }
         const start = new Date().toISOString().split('T')[0];
         const end = new Date(Date.now() + days * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
         const calendar = await clients.lidarr.getCalendar(start, end);
@@ -1912,28 +1937,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               path: added.path,
               monitored: added.monitored,
             }, null, 2),
-          }],
-        };
-      }
-
-      case "lidarr_get_root_folders": {
-        if (!clients.lidarr) throw new Error("Lidarr not configured");
-        const folders = await clients.lidarr.getRootFolders();
-        return {
-          content: [{
-            type: "text",
-            text: JSON.stringify(folders, null, 2),
-          }],
-        };
-      }
-
-      case "lidarr_get_quality_profiles": {
-        if (!clients.lidarr) throw new Error("Lidarr not configured");
-        const profiles = await clients.lidarr.getQualityProfiles();
-        return {
-          content: [{
-            type: "text",
-            text: JSON.stringify(profiles.map(p => ({ id: p.id, name: p.name })), null, 2),
           }],
         };
       }
@@ -2164,15 +2167,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           };
         }
 
-        // Map media server to naming key
-        const serverMap: Record<string, { folder: string; file: string }> = {
-          plex: { folder: 'plex-imdb', file: 'plex-imdb' },
-          emby: { folder: 'emby-imdb', file: 'emby-imdb' },
-          jellyfin: { folder: 'jellyfin-imdb', file: 'jellyfin-imdb' },
-          standard: { folder: 'default', file: 'standard' },
-        };
-
-        const keys = serverMap[mediaServer] || serverMap.standard;
+        const keys = Object.hasOwn(MEDIA_SERVER_NAMING_MAP, mediaServer)
+          ? MEDIA_SERVER_NAMING_MAP[mediaServer]
+          : MEDIA_SERVER_NAMING_MAP.standard;
 
         return {
           content: [{
@@ -2365,25 +2362,32 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           };
         }
 
-        // Map media server to naming key
-        const serverMap: Record<string, { folder: string; file: string }> = {
-          plex: { folder: 'plex-imdb', file: 'plex-imdb' },
-          emby: { folder: 'emby-imdb', file: 'emby-imdb' },
-          jellyfin: { folder: 'jellyfin-imdb', file: 'jellyfin-imdb' },
-          standard: { folder: 'default', file: 'standard' },
-        };
+        const keys = Object.hasOwn(MEDIA_SERVER_NAMING_MAP, mediaServer)
+          ? MEDIA_SERVER_NAMING_MAP[mediaServer]
+          : MEDIA_SERVER_NAMING_MAP.standard;
 
-        const keys = serverMap[mediaServer] || serverMap.standard;
-        const recommendedFolder = trashNaming.folder[keys.folder] || trashNaming.folder.default;
-        const recommendedFile = trashNaming.file[keys.file] || trashNaming.file.standard;
-
-        // Extract user's current naming (field names vary by service)
+        // Extract user's current naming and recommended values, branched by service
         const namingRecord = userNaming as unknown as Record<string, unknown>;
-        const userFolder = namingRecord.movieFolderFormat ||
-          namingRecord.seriesFolderFormat ||
-          namingRecord.standardMovieFormat;
-        const userFile = namingRecord.standardMovieFormat ||
-          namingRecord.standardEpisodeFormat;
+        let userFolder: string | undefined;
+        let userFile: string | undefined;
+        let recommendedFolder: string | undefined;
+        let recommendedFile: string | undefined;
+
+        if (service === 'radarr') {
+          userFolder = namingRecord.movieFolderFormat as string | undefined;
+          userFile = namingRecord.standardMovieFormat as string | undefined;
+          recommendedFolder = trashNaming.folder[keys.folder] || trashNaming.folder.default;
+          recommendedFile = trashNaming.file[keys.file] || trashNaming.file.standard;
+        } else {
+          // sonarr — uses seriesFolderFormat + standardEpisodeFormat
+          userFolder = namingRecord.seriesFolderFormat as string | undefined;
+          userFile = namingRecord.standardEpisodeFormat as string | undefined;
+          // Sonarr TRaSH naming has 'series' key, not 'folder'
+          recommendedFolder = (trashNaming as unknown as Record<string, Record<string, string>>).series?.[keys.folder]
+            || (trashNaming as unknown as Record<string, Record<string, string>>).series?.['default']
+            || trashNaming.folder?.[keys.folder];
+          recommendedFile = trashNaming.file[keys.file] || trashNaming.file.standard;
+        }
 
         return {
           content: [{
@@ -2422,15 +2426,144 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 });
 
 // Helper function to format bytes
-function formatBytes(bytes: number): string {
+export function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes < 0) return '0 B';
   if (bytes === 0) return '0 B';
   const k = 1024;
-  const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  const sizes = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
+  const i = Math.min(Math.floor(Math.log(bytes) / Math.log(k)), sizes.length - 1);
   return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
 }
 
-async function startHttpServer() {
+// W1.14 — clampInt helper for pagination validation
+function clampInt(value: unknown, fallback: number, min: number, max: number, name: string): number {
+  const num = typeof value === 'number' ? value : Number(value);
+  if (!Number.isFinite(num)) {
+    throw new Error(`${name} must be a number`);
+  }
+  return Math.max(min, Math.min(max, Math.floor(num)));
+}
+
+// W1.15 — Per-tool rate limiter (fixed-window, 60s)
+const RATE_LIMITS: Record<string, number> = {
+  add: 5,
+  search: 30,
+  trash_list_custom_formats: 10,
+};
+
+const rateLimitWindows = new Map<string, { count: number; resetAt: number }>();
+
+function checkRateLimit(key: string, max: number): boolean {
+  const now = Date.now();
+  const window = rateLimitWindows.get(key);
+  if (!window || now >= window.resetAt) {
+    rateLimitWindows.set(key, { count: 1, resetAt: now + 60_000 });
+    return true;
+  }
+  if (window.count >= max) return false;
+  window.count++;
+  return true;
+}
+
+function rateLimitCategory(toolName: string): { key: string; max: number } | null {
+  if (process.env.MCP_RATE_LIMIT_DISABLED === 'true') return null;
+  if (toolName.endsWith('_add_series') || toolName.endsWith('_add_movie') || toolName.endsWith('_add_artist')) {
+    return { key: 'add', max: RATE_LIMITS.add };
+  }
+  if (toolName === 'trash_list_custom_formats') {
+    return { key: 'trash_list_custom_formats', max: RATE_LIMITS.trash_list_custom_formats };
+  }
+  if (
+    toolName === 'prowlarr_search' || toolName === 'arr_search_all' ||
+    toolName.endsWith('_search') || toolName.endsWith('_search_missing') ||
+    toolName.endsWith('_search_episode') || toolName.endsWith('_search_album') ||
+    toolName.endsWith('_search_movie')
+  ) {
+    return { key: 'search', max: RATE_LIMITS.search };
+  }
+  return null;
+}
+
+function timingSafeEqualStrings(a: string, b: string): boolean {
+  // Compare against `b` length to avoid leaking `a`'s length on mismatch.
+  // We pad both to b.length so timingSafeEqual sees equal-length buffers,
+  // then OR in a length-mismatch flag so the result is false when lengths differ.
+  const bB = Buffer.from(b);
+  const aB = Buffer.alloc(bB.length);
+  Buffer.from(a).copy(aB);
+  const equal = timingSafeEqual(aB, bB);
+  return equal && Buffer.byteLength(a) === bB.length;
+}
+
+// Wildcard-bind detection: refuse unauthenticated binds on any interface.
+function isWildcardHost(host: string): boolean {
+  const h = host.trim().replace(/^\[|\]$/g, '').toLowerCase();
+  return (
+    h === '0.0.0.0' ||
+    h === '::' ||
+    h === '::0' ||
+    h === '0:0:0:0:0:0:0:0' ||
+    h === '::ffff:0.0.0.0' ||
+    h === '*' ||
+    h === ''
+  );
+}
+
+// Normalize an origin string (scheme://host[:port]) for exact-match comparison.
+function normalizeOrigin(value: string): string | null {
+  try {
+    const u = new URL(value);
+    return `${u.protocol}//${u.host}`.toLowerCase();
+  } catch {
+    return null;
+  }
+}
+
+const ALLOWED_ORIGINS_NORMALIZED = MCP_ALLOWED_ORIGINS
+  .map((o) => normalizeOrigin(o))
+  .filter((o): o is string => o !== null);
+
+// Allowed Host header values: localhost variants by default; if MCP_ALLOWED_HOSTS
+// is set, take that comma-separated list instead. Always allow the configured
+// HTTP_HOST so binding to a public IP works when the operator opts in.
+const MCP_ALLOWED_HOSTS = (process.env.MCP_ALLOWED_HOSTS || '')
+  .split(',').map((s) => s.trim()).filter(Boolean);
+function isHostHeaderAllowed(hostHeader: string | undefined, port: number): boolean {
+  if (!hostHeader) return false;
+  const lc = hostHeader.toLowerCase();
+  // Strip port for comparison
+  const hostOnly = lc.replace(/:\d+$/, '').replace(/^\[|\]$/g, '');
+  const withPort = lc;
+  if (MCP_ALLOWED_HOSTS.length > 0) {
+    return MCP_ALLOWED_HOSTS.some(
+      (allowed) => allowed.toLowerCase() === hostOnly || allowed.toLowerCase() === withPort,
+    );
+  }
+  // Default allowlist: localhost loopback variants and the configured bind host
+  const defaults = new Set([
+    'localhost', '127.0.0.1', '::1', '[::1]',
+    HTTP_HOST.toLowerCase(),
+    `${HTTP_HOST.toLowerCase()}:${port}`,
+  ]);
+  return defaults.has(hostOnly) || defaults.has(withPort);
+}
+
+async function startHttpServer(): Promise<import("node:http").Server> {
+  // W1.12 — validate HTTP_PORT inside startHttpServer (stdio mode is unaffected)
+  const HTTP_PORT_RAW = process.env.PORT ?? "3000";
+  const HTTP_PORT = Number(HTTP_PORT_RAW);
+  if (!Number.isInteger(HTTP_PORT) || HTTP_PORT < 1 || HTTP_PORT > 65535) {
+    throw new Error(`Invalid PORT: ${HTTP_PORT_RAW}`);
+  }
+
+  // W1.11 — refuse to bind any wildcard interface without auth
+  if (isWildcardHost(HTTP_HOST) && !MCP_AUTH_TOKEN) {
+    throw new Error(
+      `Refusing to bind ${HTTP_HOST || '<wildcard>'} without MCP_AUTH_TOKEN set. ` +
+      `Set the token or bind to a loopback address (127.0.0.1 / ::1).`
+    );
+  }
+
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: randomUUID,
   });
@@ -2438,60 +2571,203 @@ async function startHttpServer() {
   await server.connect(transport);
 
   const httpServer = createServer(async (req, res) => {
-    if (!req.url) {
-      res.statusCode = 400;
-      res.end("Missing URL");
-      return;
-    }
-
-    const requestUrl = new URL(req.url, `http://${req.headers.host || `${HTTP_HOST}:${HTTP_PORT}`}`);
-
-    if (requestUrl.pathname === "/health" && req.method === "GET") {
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({
-        status: "ok",
-        version: SERVER_VERSION,
-        transport: "http",
-        configuredServices: configuredServices.map((service) => service.name),
-      }));
-      return;
-    }
-
-    if (requestUrl.pathname !== HTTP_PATH) {
-      res.statusCode = 404;
-      res.end("Not found");
-      return;
-    }
+    // W1.11 — request timeout
+    req.setTimeout(MCP_REQUEST_TIMEOUT_MS, () => {
+      try { res.statusCode = 408; res.end('Request timeout'); } catch { /* ignore */ }
+      try { req.destroy(); } catch { /* ignore */ }
+    });
 
     try {
+      // W1.17 — catch URL parse errors → 400
+      let requestUrl: URL;
+      try {
+        requestUrl = new URL(req.url ?? '/', `http://${req.headers.host || `${HTTP_HOST}:${HTTP_PORT}`}`);
+      } catch {
+        res.statusCode = 400;
+        res.end('Bad request');
+        return;
+      }
+
+      // W1.11 — /health endpoint (auth-aware, DNS-rebinding hardened)
+      if (requestUrl.pathname === '/health' && req.method === 'GET') {
+        const authed = MCP_AUTH_TOKEN
+          ? typeof req.headers.authorization === 'string' &&
+            timingSafeEqualStrings(req.headers.authorization, `Bearer ${MCP_AUTH_TOKEN}`)
+          : true;
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(
+          authed
+            ? { status: 'ok', version: SERVER_VERSION, transport: 'http', configuredServices: configuredServices.map(s => s.name) }
+            : { status: 'ok' }
+        ));
+        return;
+      }
+
+      if (requestUrl.pathname !== HTTP_PATH) {
+        res.statusCode = 404;
+        res.end('Not found');
+        return;
+      }
+
+      // W1.11 — Host header validation (DNS-rebinding mitigation)
+      if (!isHostHeaderAllowed(req.headers.host, HTTP_PORT)) {
+        res.statusCode = 403;
+        res.end('Host not allowed');
+        return;
+      }
+
+      // W1.11 — Origin allowlist via exact normalized-origin match (no Referer fallback)
+      if (ALLOWED_ORIGINS_NORMALIZED.length > 0) {
+        const rawOrigin = req.headers.origin;
+        if (typeof rawOrigin === 'string' && rawOrigin.length > 0) {
+          const normalized = normalizeOrigin(rawOrigin);
+          if (!normalized || !ALLOWED_ORIGINS_NORMALIZED.includes(normalized)) {
+            res.statusCode = 403;
+            res.end('Origin not allowed');
+            return;
+          }
+        }
+      }
+
+      // W1.11 — Bearer auth
+      if (MCP_AUTH_TOKEN) {
+        const auth = req.headers.authorization;
+        if (!auth || !timingSafeEqualStrings(auth, `Bearer ${MCP_AUTH_TOKEN}`)) {
+          res.statusCode = 401;
+          res.setHeader('WWW-Authenticate', 'Bearer');
+          res.end('Unauthorized');
+          return;
+        }
+      }
+
+      // W1.11 — Body size cap.
+      // Pre-check Content-Length to reject oversized honest clients early.
+      const contentLength = Number(req.headers['content-length']);
+      if (Number.isFinite(contentLength) && contentLength > MCP_BODY_LIMIT) {
+        res.statusCode = 413;
+        res.end('Payload too large');
+        return;
+      }
+      // Defense-in-depth against chunked-encoding abuse / spoofed Content-Length:
+      // watch socket-level bytesRead. We can't attach a `req` 'data' listener
+      // here without flipping the stream into flowing mode and starving the
+      // MCP transport, but the socket's 'data' event fires on raw TCP bytes
+      // independent of the request body parser, so we can destroy the socket
+      // if the operator-declared limit is exceeded.
+      const socket = req.socket;
+      const bytesAtStart = socket.bytesRead;
+      // Allow a small header slop so we don't trip on the framing of a
+      // body-at-limit request.
+      const HEADER_SLOP = 16 * 1024;
+      const onSocketData = () => {
+        if (socket.bytesRead - bytesAtStart > MCP_BODY_LIMIT + HEADER_SLOP) {
+          try {
+            if (!res.headersSent) {
+              res.statusCode = 413;
+              res.end('Payload too large');
+            }
+          } catch { /* ignore */ }
+          socket.destroy();
+        }
+      };
+      socket.on('data', onSocketData);
+      res.on('close', () => { socket.removeListener('data', onSocketData); });
+
       await transport.handleRequest(req, res);
     } catch (error) {
-      res.statusCode = 500;
-      res.end(error instanceof Error ? error.message : String(error));
+      // W1.11 — sanitize errors (no raw error.message to client)
+      console.error('MCP transport error:', error);
+      try {
+        if (!res.headersSent) {
+          res.statusCode = 500;
+          res.setHeader('Content-Type', 'application/json');
+        }
+        res.end(JSON.stringify({ error: 'Internal server error' }));
+      } catch { /* ignore */ }
     }
   });
 
   await new Promise<void>((resolve, reject) => {
-    httpServer.once("error", reject);
+    httpServer.once('error', reject);
     httpServer.listen(HTTP_PORT, HTTP_HOST, () => resolve());
   });
 
   console.error(`*arr MCP server running over HTTP at http://${HTTP_HOST}:${HTTP_PORT}${HTTP_PATH}`);
+  return httpServer;
 }
 
 // Start the server
 async function main() {
-  if (TRANSPORT_MODE === "http") {
-    await startHttpServer();
-    return;
+  // W1.3 — startup assertion: no duplicate tool names
+  const toolNames = TOOLS.map(t => t.name);
+  if (new Set(toolNames).size !== toolNames.length) {
+    const seen = new Set<string>();
+    const dups = toolNames.filter(n => seen.size === seen.add(n).size);
+    throw new Error(`Duplicate tool registrations detected: ${[...new Set(dups)].join(', ')}`);
   }
 
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
-  console.error(`*arr MCP server running over stdio - configured services: ${configuredServices.map(s => s.name).join(', ') || 'none (TRaSH-only mode)'}`);
+  let httpServerRef: import("node:http").Server | undefined;
+
+  if (TRANSPORT_MODE === "http") {
+    httpServerRef = await startHttpServer();
+  } else {
+    const transport = new StdioServerTransport();
+    await server.connect(transport);
+    console.error(`*arr MCP server running over stdio - configured services: ${configuredServices.map(s => s.name).join(', ') || 'none (TRaSH-only mode)'}`);
+  }
+
+  // W1.16 — graceful shutdown
+  let shuttingDown = false;
+  const shutdown = async (signal: string) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.error(`Received ${signal}, shutting down...`);
+
+    // Force-exit after 5s if graceful shutdown stalls (open keep-alive sockets etc.)
+    const forceExit = setTimeout(() => {
+      console.error('Graceful shutdown timeout — forcing exit');
+      process.exit(0);
+    }, 5_000);
+    forceExit.unref();
+
+    if (httpServerRef) {
+      // Begin graceful drain: stop accepting new connections and let active
+      // requests finish.
+      const closed = new Promise<void>(r => httpServerRef!.close(() => r()));
+      // Close idle keep-alive sockets immediately (they have nothing in flight).
+      httpServerRef.closeIdleConnections?.();
+      // Race the drain against a short grace window before force-closing.
+      const drainTimeout = new Promise<void>(r => setTimeout(r, 2_000).unref());
+      await Promise.race([closed, drainTimeout]);
+      httpServerRef.closeAllConnections?.();
+      await closed;
+    }
+    await server.close().catch(() => {});
+    clearTimeout(forceExit);
+    process.exit(0);
+  };
+  process.on('SIGTERM', () => { void shutdown('SIGTERM'); });
+  process.on('SIGINT', () => { void shutdown('SIGINT'); });
 }
 
-main().catch((error) => {
-  console.error("Fatal error:", error);
-  process.exit(1);
-});
+// Only run main() when this module is the CLI entrypoint. Importing this
+// module (e.g. for unit tests of exported helpers) must not start the server.
+import { fileURLToPath } from "node:url";
+import { realpathSync } from "node:fs";
+function isCliEntrypoint(): boolean {
+  const argv1 = process.argv[1];
+  if (!argv1) return false;
+  const here = fileURLToPath(import.meta.url);
+  if (argv1 === here) return true;
+  try {
+    return realpathSync(argv1) === realpathSync(here);
+  } catch {
+    return false;
+  }
+}
+if (isCliEntrypoint()) {
+  main().catch((error) => {
+    console.error("Fatal error:", error);
+    process.exit(1);
+  });
+}

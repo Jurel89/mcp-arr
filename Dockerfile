@@ -1,5 +1,6 @@
 # Build stage
-FROM node:20-alpine AS builder
+FROM node:22-alpine AS builder
+# TODO: pin by digest for reproducibility (e.g. node:22-alpine@sha256:...)
 
 WORKDIR /app
 
@@ -17,7 +18,8 @@ COPY src/ ./src/
 RUN npm run build
 
 # Production stage
-FROM node:20-alpine
+FROM node:22-alpine
+# TODO: pin by digest for reproducibility
 
 WORKDIR /app
 

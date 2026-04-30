@@ -11,6 +11,21 @@ const TRASH_BASE_URL = 'https://raw.githubusercontent.com/TRaSH-Guides/Guides/ma
 const GITHUB_API_URL = 'https://api.github.com/repos/TRaSH-Guides/Guides/contents/docs/json';
 const CACHE_TTL = 60 * 60 * 1000; // 1 hour
 
+// W3.3 — Known TRaSH categories (validated at runtime)
+const KNOWN_CATEGORIES = ['hdr', 'audio', 'resolution', 'source', 'streaming', 'anime', 'unwanted', 'release', 'language', 'other'] as const;
+type KnownCategory = typeof KNOWN_CATEGORIES[number];
+
+// W3.1 — Singleflight: in-flight promise coalescing
+const inflight = new Map<string, Promise<unknown>>();
+
+function singleflight<T>(key: string, fn: () => Promise<T>): Promise<T> {
+  const existing = inflight.get(key) as Promise<T> | undefined;
+  if (existing) return existing;
+  const p = fn().finally(() => inflight.delete(key));
+  inflight.set(key, p);
+  return p;
+}
+
 // Types
 export type TrashService = 'radarr' | 'sonarr';
 
@@ -91,6 +106,8 @@ interface CacheEntry<T> {
 class TrashCache {
   private profiles = new Map<string, CacheEntry<TrashQualityProfile>>();
   private profileLists = new Map<string, CacheEntry<string[]>>();
+  // W3.2 — Summarized profile list cache (avoids N+1 on repeat calls)
+  private profileSummaries = new Map<string, CacheEntry<Array<{ name: string; description?: string }>>>();
   private customFormats = new Map<string, CacheEntry<TrashCustomFormat>>();
   private cfLists = new Map<string, CacheEntry<string[]>>();
   private cfGroups = new Map<string, CacheEntry<TrashCFGroup>>();
@@ -116,6 +133,15 @@ class TrashCache {
 
   getProfileList(service: string): string[] | null {
     const entry = this.profileLists.get(service);
+    return this.isValid(entry) ? entry.data : null;
+  }
+
+  setProfileSummaries(service: string, data: Array<{ name: string; description?: string }>) {
+    this.profileSummaries.set(service, { data, timestamp: Date.now() });
+  }
+
+  getProfileSummaries(service: string): Array<{ name: string; description?: string }> | null {
+    const entry = this.profileSummaries.get(service);
     return this.isValid(entry) ? entry.data : null;
   }
 
@@ -167,6 +193,7 @@ class TrashCache {
   clear() {
     this.profiles.clear();
     this.profileLists.clear();
+    this.profileSummaries.clear();
     this.customFormats.clear();
     this.cfLists.clear();
     this.cfGroups.clear();
@@ -200,57 +227,64 @@ function categorizeCustomFormat(name: string): string[] {
   return categories.length > 0 ? categories : ['other'];
 }
 
-// API functions
+// W3.4 — fetchJSON with AbortSignal.timeout(30s) and optional GITHUB_TOKEN auth
 async function fetchJSON<T>(url: string): Promise<T> {
-  const response = await fetch(url);
+  const headers: Record<string, string> = {};
+  const token = process.env.GITHUB_TOKEN;
+  if (token && (url.includes('api.github.com') || url.includes('raw.githubusercontent.com'))) {
+    headers.Authorization = `Bearer ${token}`;
+  }
+  const response = await fetch(url, { headers, signal: AbortSignal.timeout(30_000) });
   if (!response.ok) {
     throw new Error(`Failed to fetch ${url}: ${response.status} ${response.statusText}`);
   }
   return response.json() as Promise<T>;
 }
 
+// W3.1 — listGitHubDir wrapped with singleflight
 async function listGitHubDir(path: string): Promise<string[]> {
-  interface GitHubFile {
-    name: string;
-    type: string;
-  }
-  const files = await fetchJSON<GitHubFile[]>(`${GITHUB_API_URL}/${path}`);
-  return files
-    .filter(f => f.type === 'file' && f.name.endsWith('.json'))
-    .map(f => f.name.replace('.json', ''));
+  return singleflight(`dir:${path}`, async () => {
+    interface GitHubFile {
+      name: string;
+      type: string;
+    }
+    const files = await fetchJSON<GitHubFile[]>(`${GITHUB_API_URL}/${path}`);
+    return files
+      .filter(f => f.type === 'file' && f.name.endsWith('.json'))
+      .map(f => f.name.replace('.json', ''));
+  });
 }
 
 // Public API
 export class TrashClient {
   /**
    * List available quality profiles
+   * W3.2 — Returns cached summaries as a single entry; no N+1 fetch pattern
    */
   async listProfiles(service: TrashService): Promise<{ name: string; description?: string }[]> {
-    // Check cache
-    const cached = cache.getProfileList(service);
-    if (cached) {
-      // Fetch details for each
+    // W3.2: Check summarized cache first
+    const cachedSummaries = cache.getProfileSummaries(service);
+    if (cachedSummaries) return cachedSummaries;
+
+    // W3.1: Singleflight the entire list+details fetch
+    return singleflight(`profileList:${service}`, async () => {
+      // Fetch directory listing
+      const profileNames = await listGitHubDir(`${service}/quality-profiles`);
+      cache.setProfileList(service, profileNames);
+
+      // Fetch all profiles in parallel for summaries
       const profiles = await Promise.all(
-        cached.map(name => this.getProfile(service, name))
+        profileNames.map(name => this.getProfile(service, name))
       );
-      return profiles.filter((p): p is TrashQualityProfile => p !== null).map(p => ({
-        name: p.name,
-        description: p.trash_description,
-      }));
-    }
 
-    // Fetch list from GitHub
-    const profileNames = await listGitHubDir(`${service}/quality-profiles`);
-    cache.setProfileList(service, profileNames);
+      const summaries = profiles
+        .filter((p): p is TrashQualityProfile => p !== null)
+        .map(p => ({ name: p.name, description: p.trash_description }));
 
-    // Fetch details
-    const profiles = await Promise.all(
-      profileNames.map(name => this.getProfile(service, name))
-    );
-    return profiles.filter((p): p is TrashQualityProfile => p !== null).map(p => ({
-      name: p.name,
-      description: p.trash_description,
-    }));
+      // W3.2: Cache the summarized list as a single entry
+      cache.setProfileSummaries(service, summaries);
+      return summaries;
+    });
   }
 
   /**
@@ -261,25 +295,34 @@ export class TrashClient {
     const cached = cache.getProfile(key);
     if (cached) return cached;
 
-    try {
-      const profile = await fetchJSON<TrashQualityProfile>(
-        `${TRASH_BASE_URL}/${service}/quality-profiles/${profileName}.json`
-      );
-      cache.setProfile(key, profile);
-      return profile;
-    } catch {
-      return null;
-    }
+    // W3.1: Singleflight per profile
+    return singleflight(`profile:${service}:${profileName}`, async () => {
+      try {
+        const profile = await fetchJSON<TrashQualityProfile>(
+          `${TRASH_BASE_URL}/${service}/quality-profiles/${profileName}.json`
+        );
+        cache.setProfile(key, profile);
+        return profile;
+      } catch {
+        return null;
+      }
+    });
   }
 
   /**
    * List available custom formats
+   * W3.3 — Validates category against known set
    */
   async listCustomFormats(service: TrashService, category?: string): Promise<{ name: string; categories: string[]; defaultScore?: number }[]> {
-    // Check cache
+    // W3.3: Validate category enum
+    if (category !== undefined && !KNOWN_CATEGORIES.includes(category as KnownCategory)) {
+      throw new Error(`Unknown category "${category}". Allowed: ${KNOWN_CATEGORIES.join(', ')}`);
+    }
+
+    // W3.1: Singleflight the CF directory listing (key does not include category — same fetch covers all)
     let cfNames = cache.getCFList(service);
     if (!cfNames) {
-      cfNames = await listGitHubDir(`${service}/cf`);
+      cfNames = await singleflight(`cfList:${service}`, () => listGitHubDir(`${service}/cf`));
       cache.setCFList(service, cfNames);
     }
 
@@ -321,15 +364,18 @@ export class TrashClient {
     const cached = cache.getCustomFormat(key);
     if (cached) return cached;
 
-    try {
-      const cf = await fetchJSON<TrashCustomFormat>(
-        `${TRASH_BASE_URL}/${service}/cf/${cfName}.json`
-      );
-      cache.setCustomFormat(key, cf);
-      return cf;
-    } catch {
-      return null;
-    }
+    // W3.1: Singleflight per custom format
+    return singleflight(`cf:${service}:${cfName}`, async () => {
+      try {
+        const cf = await fetchJSON<TrashCustomFormat>(
+          `${TRASH_BASE_URL}/${service}/cf/${cfName}.json`
+        );
+        cache.setCustomFormat(key, cf);
+        return cf;
+      } catch {
+        return null;
+      }
+    });
   }
 
   /**
@@ -339,15 +385,18 @@ export class TrashClient {
     const cached = cache.getNaming(service);
     if (cached) return cached;
 
-    try {
-      const naming = await fetchJSON<TrashNaming>(
-        `${TRASH_BASE_URL}/${service}/naming/${service}-naming.json`
-      );
-      cache.setNaming(service, naming);
-      return naming;
-    } catch {
-      return null;
-    }
+    // W3.1: Singleflight per service naming
+    return singleflight(`naming:${service}`, async () => {
+      try {
+        const naming = await fetchJSON<TrashNaming>(
+          `${TRASH_BASE_URL}/${service}/naming/${service}-naming.json`
+        );
+        cache.setNaming(service, naming);
+        return naming;
+      } catch {
+        return null;
+      }
+    });
   }
 
   /**
@@ -365,17 +414,23 @@ export class TrashClient {
       let size = cache.getQualitySize(key);
 
       if (!size) {
-        try {
-          size = await fetchJSON<TrashQualitySize>(
-            `${TRASH_BASE_URL}/${service}/quality-size/${sizeType}.json`
-          );
-          cache.setQualitySize(key, size);
-        } catch {
-          continue;
+        // W3.1: Singleflight per size type
+        const fetched = await singleflight(`qualitySizes:${service}:${sizeType}`, async () => {
+          try {
+            return await fetchJSON<TrashQualitySize>(
+              `${TRASH_BASE_URL}/${service}/quality-size/${sizeType}.json`
+            );
+          } catch {
+            return null;
+          }
+        });
+        if (fetched) {
+          cache.setQualitySize(key, fetched);
+          size = fetched;
         }
       }
 
-      if (!type || size.type === type) {
+      if (size && (!type || size.type === type)) {
         sizes.push(size);
       }
     }
@@ -387,7 +442,8 @@ export class TrashClient {
    * Get custom format groups
    */
   async listCFGroups(service: TrashService): Promise<string[]> {
-    return listGitHubDir(`${service}/cf-groups`);
+    // W3.1: Singleflight for CF group listing
+    return singleflight(`cfGroupList:${service}`, () => listGitHubDir(`${service}/cf-groups`));
   }
 
   /**
@@ -398,15 +454,18 @@ export class TrashClient {
     const cached = cache.getCFGroup(key);
     if (cached) return cached;
 
-    try {
-      const group = await fetchJSON<TrashCFGroup>(
-        `${TRASH_BASE_URL}/${service}/cf-groups/${groupName}.json`
-      );
-      cache.setCFGroup(key, group);
-      return group;
-    } catch {
-      return null;
-    }
+    // W3.1: Singleflight per CF group
+    return singleflight(`cfGroup:${service}:${groupName}`, async () => {
+      try {
+        const group = await fetchJSON<TrashCFGroup>(
+          `${TRASH_BASE_URL}/${service}/cf-groups/${groupName}.json`
+        );
+        cache.setCFGroup(key, group);
+        return group;
+      } catch {
+        return null;
+      }
+    });
   }
 
   /**

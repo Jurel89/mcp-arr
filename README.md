@@ -252,6 +252,22 @@ The existing service-specific tools remain available for richer local or power-u
 - "Check status of all my *arr services"
 - "Search for 'comedy' across all services"
 
+## Security
+
+When running in remote HTTP mode, the server should be hardened with the following environment variables:
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `MCP_AUTH_TOKEN` | unset | When set, every `/mcp` request must include `Authorization: Bearer <token>`. **Required when binding to any wildcard interface (`0.0.0.0`, `::`)** — startup will refuse otherwise. Comparison is timing-safe. |
+| `MCP_ALLOWED_ORIGINS` | unset | Comma-separated list of allowed `Origin` headers (e.g. `https://chat.openai.com`). Mitigates DNS rebinding from browsers. Matching is **exact normalized origin** (scheme + host + port), not prefix. Requests with an `Origin` not in the allowlist are rejected with `403`. |
+| `MCP_ALLOWED_HOSTS` | localhost variants + bind host | Comma-separated allowlist of `Host` header values. Defaults to `localhost`, `127.0.0.1`, `::1`, and the configured `HOST`. Mitigates DNS rebinding by rejecting requests whose `Host` does not match the allowlist (`403`). |
+| `MCP_BODY_LIMIT_BYTES` | `1048576` (1 MB) | Maximum request body size. Larger requests get `413`. The check uses the `Content-Length` header pre-handler plus a socket-level byte counter that catches chunked-encoding and spoofed-length abuse. |
+| `MCP_REQUEST_TIMEOUT_MS` | `30000` | Per-request timeout. Prevents slowloris-style attacks. |
+| `MCP_RATE_LIMIT_DISABLED` | unset | Set to `"true"` to disable the per-tool rate limiter (default: enabled, 60-second windows for add/search/command tools). |
+| `GITHUB_TOKEN` | unset | Optional GitHub token used when fetching TRaSH Guides data. Raises the unauthenticated 60 req/hr rate limit to 5000 req/hr. |
+
+> Running the HTTP transport on `0.0.0.0` without `MCP_AUTH_TOKEN` will fail to start. This is a deliberate safety check — anyone on the network would otherwise be able to drive your *arr stack.
+
 ## Available Tools
 
 ### General Tools
